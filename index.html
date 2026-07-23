@@ -39,6 +39,7 @@
 </head>
 <body>
   <div id="status" style="display:none">Loading…</div>
+  <div id="hud" style="position:fixed;bottom:calc(10px + env(safe-area-inset-bottom));left:10px;z-index:10;font:12px ui-monospace,monospace;color:#0f0;background:rgba(0,0,0,0.55);padding:5px 8px;border-radius:4px;display:none;white-space:pre"></div>
   <div id="start-overlay">
     <button id="start-btn">Start Camera</button>
     <p>Uses your front camera to mirror your hands &amp; body onto a 3D avatar. Nothing is recorded or uploaded.</p>
@@ -54,7 +55,8 @@
     // ------------------ Config / tuning ------------------
     const HAND_URL   = "hand.glb";            // Rigged low-poly hand
     const BODY_URL   = "human_base_mesh.glb"; // Rigged full-body avatar
-    const MIRROR     = true;   // Selfie-view horizontal mirror
+    const USE_REAR   = true;   // Rear (environment) camera; front cam is the fallback
+    const MIRROR     = !USE_REAR; // Selfie-view horizontal mirror (front cam only)
     const USE_GPU    = true;   // MediaPipe GPU delegate (desktop)
     const ARTICULATE = true;   // Drive finger bones (needs rigged GLB)
     const SHOW_HANDS = true;   // Floating articulated hands
@@ -64,6 +66,8 @@
     const BODY_SCALE = 1.8;
     const GRID_Y     = -3;     // Court floor height (avatar feet)
     const lerpFactor = 0.3;    // Smoothing (0 = frozen, 1 = instant)
+    const BODY_LERP  = 0.15;   // Heavier smoothing for body limbs (kills leg jitter)
+    const MIN_VIS    = 0.6;    // Landmark visibility below this -> bone relaxes to rest
     // MediaPipe world-space -> three.js axis signs.
     // Flip a sign if a limb bends the wrong way / hand looks mirrored.
     const FLIP      = { x: MIRROR ? -1 : 1, y: -1, z: -1 };
@@ -73,7 +77,9 @@
     const BODY_EULER = [0, 0, 0]; // Body avatar
     // Attach rigged hands onto the avatar wrists (replaces its mitts)
     const ATTACH_HANDS_TO_BODY = true;
-    const SWAP_HANDEDNESS   = false;     // Flip if L/R fingers drive wrong side
+    // MediaPipe reports handedness assuming a mirrored selfie image, so the
+    // labels invert on the (unmirrored) rear camera.
+    const SWAP_HANDEDNESS   = USE_REAR;  // Flip if L/R fingers drive wrong side
     const HAND_ATTACH_SCALE = 0.04;      // Rigged hand size at the wrist
     const HAND_ATTACH_POS   = [0, 0, 0]; // Wrist-local offset
     const HAND_ATTACH_EULER = [0, 0, 0]; // Wrist-local rotation
@@ -110,6 +116,14 @@
     let bodyRoot = null;
     const poseJoints = [];
     const statusEl = document.getElementById("status");
+    const hudEl = document.getElementById("hud");
+    // Live tracking diagnostics (shown in the on-screen HUD)
+    const diag = { hands: 0, body: false, handModel: "…", bodyModel: "…" };
+    function updateHud() {
+      hudEl.textContent =
+        `hands seen: ${diag.hands}\nbody seen: ${diag.body ? "yes" : "no"}\n` +
+        `hand model: ${diag.handModel}\nbody model: ${diag.bodyModel}`;
+    }
 
     // Reusable temporaries (avoid per-frame allocation)
     const _q1 = new THREE.Quaternion();
@@ -143,9 +157,18 @@
       const restFwdParent = child.position.clone().normalize().applyQuaternion(bone.quaternion);
       return { bone, restQuat: bone.quaternion.clone(), restFwdParent, seg };
     }
-    // Rotate each driven bone toward its live landmark direction
-    function driveBones(driven, worldLandmarks, flip, smooth = 1) {
+    // Rotate each driven bone toward its live landmark direction.
+    // visLm (optional, e.g. normalized pose landmarks): bones whose endpoints
+    // aren't confidently visible ease back to rest instead of flailing.
+    function driveBones(driven, worldLandmarks, flip, smooth = 1, visLm = null) {
       for (const d of driven) {
+        if (visLm) {
+          const va = visLm[d.seg[0]].visibility, vb = visLm[d.seg[1]].visibility;
+          if (va < MIN_VIS || vb < MIN_VIS) {
+            d.bone.quaternion.slerp(d.restQuat, smooth);
+            continue;
+          }
+        }
         const a = worldLandmarks[d.seg[0]];
         const b = worldLandmarks[d.seg[1]];
         _v1.set((b.x - a.x) * flip.x, (b.y - a.y) * flip.y, (b.z - a.z) * flip.z);
@@ -246,9 +269,10 @@
           let skinned = false;
           gltf.scene.traverse((c) => { if (c.isSkinnedMesh) skinned = true; });
           setupHands(gltf.scene, skinned);
+          diag.handModel = skinned ? "loaded (rigged)" : "loaded (rigid)"; updateHud();
         },
         undefined,
-        (err) => { console.warn("Hand model failed; using fallback.", err); setupHands(buildFallbackHand(), false); }
+        (err) => { console.warn("Hand model failed; using fallback.", err); setupHands(buildFallbackHand(), false); diag.handModel = "GLB FAILED → fallback"; updateHud(); }
       );
     }
 
@@ -268,9 +292,10 @@
           scene.add(bodyRoot);
           console.log("Body rig:", bodyRoot.userData.driven.length, "driven bones");
           tryAttachHands();
+          diag.bodyModel = `loaded (${bodyRoot.userData.driven.length} bones)`; updateHud();
         },
         undefined,
-        (err) => console.warn("Body model failed.", err)
+        (err) => { console.warn("Body model failed.", err); diag.bodyModel = "GLB FAILED"; updateHud(); }
       );
     }
 
@@ -288,7 +313,7 @@
       if (!bodyRoot || !leftHandMesh || !rightHandMesh) return;
       const wristL = bodyRoot.getObjectByName('HandL_06');
       const wristR = bodyRoot.getObjectByName('HandR_012');
-      if (!wristL || !wristR) { console.warn("Wrist bones not found."); return; }
+      if (!wristL || !wristR) { console.warn("Wrist bones not found."); diag.handModel += " (no wrist attach)"; updateHud(); return; }
       attachHand(leftHandMesh, wristL, true);
       attachHand(rightHandMesh, wristR, false);
       // Remove the avatar's built-in mitts
@@ -386,7 +411,11 @@
         handLandmarker = await HandLandmarker.createFromOptions(vision, {
           baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-assets/hand_landmarker.task", delegate },
           runningMode: "VIDEO",
-          numHands: 2
+          numHands: 2,
+          // Hands are small in a full-body rear-cam frame; loosen thresholds.
+          minHandDetectionConfidence: 0.3,
+          minHandPresenceConfidence: 0.3,
+          minTrackingConfidence: 0.3
         });
         poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
           baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-assets/pose_landmarker.task", delegate },
@@ -411,14 +440,18 @@
       video = document.getElementById("webcam");
       // facingMode 'user' = front (selfie) camera on iPhone; ideal-constraints
       // let iOS pick the closest supported resolution instead of failing.
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: "user",
-          width: { ideal: 1280 },
-          height: { ideal: 720 }
-        },
-        audio: false
-      });
+      const facing = USE_REAR ? { ideal: "environment" } : "user";
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: false
+        });
+      } catch (e) {
+        // Some devices reject an exact rear request; retry with any camera.
+        console.warn("Preferred camera failed, using any available.", e);
+        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      }
       video.srcObject = stream;
       await new Promise(resolve => video.onloadedmetadata = resolve);
       await video.play();
@@ -472,6 +505,8 @@
             if (!seenL && leftHandMesh && leftHandMesh.userData.driven) relaxBones(leftHandMesh.userData.driven, lerpFactor);
             if (!seenR && rightHandMesh && rightHandMesh.userData.driven) relaxBones(rightHandMesh.userData.driven, lerpFactor);
           }
+          diag.hands = handResults.landmarks ? handResults.landmarks.length : 0;
+          updateHud();
         }
 
         // --- Body pose ---
@@ -480,13 +515,14 @@
           const poseResults = poseLandmarker.detectForVideo(video, now);
           const lm = poseResults.landmarks && poseResults.landmarks[0];
           const wl = poseResults.worldLandmarks && poseResults.worldLandmarks[0];
+          diag.body = !!(lm && wl); updateHud();
           if (lm && wl) {
             if (bodyRoot && SHOW_BODY) {
               bodyRoot.visible = true;
               const hipx = (lm[23].x + lm[24].x) / 2;
               _v2.copy(mapToWorld(hipx, 0.5, 0)); _v2.y = GRID_Y; _v2.z = 0;
-              bodyRoot.position.lerp(_v2, lerpFactor);
-              if (bodyRoot.userData.driven) driveBones(bodyRoot.userData.driven, wl, BODY_FLIP, lerpFactor);
+              bodyRoot.position.lerp(_v2, BODY_LERP);
+              if (bodyRoot.userData.driven) driveBones(bodyRoot.userData.driven, wl, BODY_FLIP, BODY_LERP, lm);
               driveHead(bodyRoot, wl);
             }
             updatePoseSkeleton(lm);
@@ -510,6 +546,7 @@
     document.getElementById("start-btn").addEventListener("click", () => {
       document.getElementById("start-overlay").style.display = "none";
       statusEl.style.display = "";
+      hudEl.style.display = ""; updateHud();
       init().catch((e) => {
         console.error(e);
         statusEl.style.display = "";
