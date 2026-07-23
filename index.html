@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <title>3D Hand & Body Tracking (Three.js)</title>
+  <style>
+    html, body { margin: 0; overflow: hidden; background: #000; height: 100%; touch-action: none; -webkit-user-select: none; user-select: none; overscroll-behavior: none; }
+    #webcam { display: none; }
+    #canvas-container { position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh; }
+    #status {
+      position: fixed; top: calc(10px + env(safe-area-inset-top)); left: calc(10px + env(safe-area-inset-left)); z-index: 10;
+      font: 14px system-ui, sans-serif; color: #fff;
+      background: rgba(0,0,0,0.5); padding: 6px 10px; border-radius: 4px;
+    }
+    /* iOS requires a user gesture before the camera can start */
+    #start-overlay {
+      position: fixed; inset: 0; z-index: 20;
+      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+      background: #000; color: #fff; font: 16px system-ui, sans-serif; text-align: center; padding: 24px;
+    }
+    #start-overlay button {
+      font: 600 18px system-ui, sans-serif; color: #000; background: #fff;
+      border: none; border-radius: 999px; padding: 14px 34px; cursor: pointer;
+    }
+    #start-overlay p { max-width: 320px; opacity: 0.7; margin: 0; line-height: 1.4; }
+  </style>
+  <!-- Import Three.js and loaders via Import Maps -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="status" style="display:none">Loading…</div>
+  <div id="start-overlay">
+    <button id="start-btn">Start Camera</button>
+    <p>Uses your front camera to mirror your hands &amp; body onto a 3D avatar. Nothing is recorded or uploaded.</p>
+  </div>
+  <video id="webcam" autoplay playsinline muted></video>
+  <div id="canvas-container"></div>
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import { clone as skeletonClone } from 'three/addons/utils/SkeletonUtils.js';
+    import { HandLandmarker, PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
+
+    // ------------------ Config / tuning ------------------
+    const HAND_URL   = "hand.glb";            // Rigged low-poly hand
+    const BODY_URL   = "human_base_mesh.glb"; // Rigged full-body avatar
+    const MIRROR     = true;   // Selfie-view horizontal mirror
+    const USE_GPU    = true;   // MediaPipe GPU delegate (desktop)
+    const ARTICULATE = true;   // Drive finger bones (needs rigged GLB)
+    const SHOW_HANDS = true;   // Floating articulated hands
+    const SHOW_BODY  = true;   // Full-body avatar
+    const SHOW_POSE_SKELETON = false; // Debug cyan stick figure
+    const HAND_SCALE = 0.5;
+    const BODY_SCALE = 1.8;
+    const GRID_Y     = -3;     // Court floor height (avatar feet)
+    const lerpFactor = 0.3;    // Smoothing (0 = frozen, 1 = instant)
+    // MediaPipe world-space -> three.js axis signs.
+    // Flip a sign if a limb bends the wrong way / hand looks mirrored.
+    const FLIP      = { x: MIRROR ? -1 : 1, y: -1, z: -1 };
+    const BODY_FLIP = { x: MIRROR ? -1 : 1, y: -1, z: -1 };
+    // Extra whole-model rotation (radians) if it faces the wrong way.
+    const RIG_EULER  = [0, 0, 0]; // Hands
+    const BODY_EULER = [0, 0, 0]; // Body avatar
+    // Attach rigged hands onto the avatar wrists (replaces its mitts)
+    const ATTACH_HANDS_TO_BODY = true;
+    const SWAP_HANDEDNESS   = false;     // Flip if L/R fingers drive wrong side
+    const HAND_ATTACH_SCALE = 0.04;      // Rigged hand size at the wrist
+    const HAND_ATTACH_POS   = [0, 0, 0]; // Wrist-local offset
+    const HAND_ATTACH_EULER = [0, 0, 0]; // Wrist-local rotation
+    // -----------------------------------------------------
+
+    // Verified finger -> bone chains for hand.glb (thumb drives 2, others 3)
+    const FINGER_BONES = {
+      thumb:  ['Bone.005_18', 'Bone.018_17', 'Bone.019_16'],
+      index:  ['Bone.002_7',  'Bone.008_6',  'Bone.012_5', 'Bone.014_4'],
+      middle: ['Bone.003_11', 'Bone.009_10', 'Bone.013_9', 'Bone.015_8'],
+      ring:   ['Bone.001_3',  'Bone.007_2',  'Bone.011_1', 'Bone.016_0'],
+      pinky:  ['Bone.004_15', 'Bone.006_14', 'Bone.010_13','Bone.017_12']
+    };
+    // Landmark index pairs each driven finger bone points along
+    const FINGER_SEGMENTS = {
+      thumb:  [[1, 2], [2, 3]],
+      index:  [[0, 5], [5, 6], [6, 7]],
+      middle: [[0, 9], [9, 10], [10, 11]],
+      ring:   [[0, 13], [13, 14], [14, 15]],
+      pinky:  [[0, 17], [17, 18], [18, 19]]
+    };
+    // Body bone -> pose landmark pair it aims along (limbs)
+    const BODY_SEGMENTS = {
+      ShoulderL_04:  [11, 13], ElbowL_05:  [13, 15],
+      ShoulderR_010: [12, 14], ElbowR_011: [14, 16],
+      HipL_013:      [23, 25], KneeL_014:  [25, 27],
+      HipR_016:      [24, 26], KneeR_017:  [26, 28]
+    };
+
+    // --- Variables ---
+    let video, scene, camera, renderer;
+    let handLandmarker, poseLandmarker;
+    let leftHandMesh, rightHandMesh; // root Object3D; rig on .userData
+    let bodyRoot = null;
+    const poseJoints = [];
+    const statusEl = document.getElementById("status");
+
+    // Reusable temporaries (avoid per-frame allocation)
+    const _q1 = new THREE.Quaternion();
+    const _q2 = new THREE.Quaternion();
+    const _q3 = new THREE.Quaternion();
+    const _v1 = new THREE.Vector3();
+    const _v2 = new THREE.Vector3();
+
+    // Pose skeleton connectors (MediaPipe Pose indices)
+    const POSE_CONNECTIONS = [
+      [11, 12], [11, 13], [13, 15], [12, 14], [14, 16], // Upper body
+      [11, 23], [12, 24], [23, 24],                     // Torso
+      [23, 25], [24, 26], [25, 27], [26, 28]            // Lower body
+    ];
+    let poseLines;
+
+    // Map normalized coords (0..1) to 3D world coords
+    function mapToWorld(x, y, z = 0) {
+      const sx = MIRROR ? 1 - x : x;
+      return new THREE.Vector3((sx - 0.5) * 10, -(y - 0.5) * 6, -z * 5);
+    }
+
+    // --- Shared bone-retarget engine ---
+    function firstBoneChild(bone) {
+      return bone.children.find((c) => c.isBone) || bone.children[0];
+    }
+    // Precompute one driven bone: aims at its child, points along seg live
+    function makeDriven(bone, seg) {
+      const child = firstBoneChild(bone);
+      if (!child) return null;
+      const restFwdParent = child.position.clone().normalize().applyQuaternion(bone.quaternion);
+      return { bone, restQuat: bone.quaternion.clone(), restFwdParent, seg };
+    }
+    // Rotate each driven bone toward its live landmark direction
+    function driveBones(driven, worldLandmarks, flip, smooth = 1) {
+      for (const d of driven) {
+        const a = worldLandmarks[d.seg[0]];
+        const b = worldLandmarks[d.seg[1]];
+        _v1.set((b.x - a.x) * flip.x, (b.y - a.y) * flip.y, (b.z - a.z) * flip.z);
+        if (_v1.lengthSq() < 1e-8) continue;
+        _v1.normalize();
+        d.bone.parent.getWorldQuaternion(_q1);         // parent world (fresh)
+        _v1.applyQuaternion(_q2.copy(_q1).invert());    // target in parent frame
+        _q3.setFromUnitVectors(d.restFwdParent, _v1);   // rotate rest -> target
+        d.bone.quaternion.slerp(_q3.multiply(d.restQuat), smooth); // ease to target
+      }
+    }
+    // Ease driven bones back to rest (untracked -> open hand)
+    function relaxBones(driven, smooth) {
+      for (const d of driven) d.bone.quaternion.slerp(d.restQuat, smooth);
+    }
+    // Aim one bone toward an explicit world direction (head)
+    function aimBone(d, dir) {
+      if (!d || dir.lengthSq() < 1e-8) return;
+      dir.normalize();
+      d.bone.parent.getWorldQuaternion(_q1);
+      dir.applyQuaternion(_q2.copy(_q1).invert());
+      _q3.setFromUnitVectors(d.restFwdParent, dir);
+      d.bone.quaternion.copy(_q3.multiply(d.restQuat));
+    }
+
+    // Skin material for hand meshes
+    function handMaterial() {
+      return new THREE.MeshStandardMaterial({
+        color: 0xe0ac69, roughness: 0.4, metalness: 0.1, side: THREE.DoubleSide
+      });
+    }
+    function applySkin(root) {
+      root.traverse((child) => { if (child.isMesh) child.material = handMaterial(); });
+    }
+
+    // Placeholder hand if the GLB fails
+    function buildFallbackHand() {
+      const hand = new THREE.Group();
+      const mat = handMaterial();
+      hand.add(new THREE.Mesh(new THREE.BoxGeometry(1.4, 1.6, 0.5), mat));
+      const fingerGeo = new THREE.BoxGeometry(0.28, 1.2, 0.3);
+      for (let i = 0; i < 4; i++) {
+        const f = new THREE.Mesh(fingerGeo, mat);
+        f.position.set(-0.5 + i * 0.36, 1.3, 0);
+        hand.add(f);
+      }
+      const thumb = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.9, 0.3), mat);
+      thumb.position.set(-0.85, 0.4, 0);
+      thumb.rotation.z = Math.PI / 4;
+      hand.add(thumb);
+      return hand;
+    }
+
+    // Finger rig for a cloned hand root
+    function buildFingerRig(root) {
+      const driven = [];
+      let ok = true;
+      for (const finger in FINGER_BONES) {
+        const names = FINGER_BONES[finger];
+        const segs = FINGER_SEGMENTS[finger];
+        const bones = names.map((n) => root.getObjectByName(n));
+        if (bones.some((b) => !b)) { ok = false; continue; }
+        for (let k = 0; k < segs.length; k++) {
+          const d = makeDriven(bones[k], segs[k]); // child = next phalanx
+          if (d) driven.push(d);
+        }
+      }
+      if (!ok || driven.length === 0) {
+        console.warn("Finger bones not found; hand stays rigid.");
+        return null;
+      }
+      console.log("Finger rig:", driven.length, "driven bones");
+      return driven;
+    }
+
+    // Turn a loaded/base hand model into left + right hands
+    function setupHands(baseScene, skinned) {
+      const makeHand = (mirror) => {
+        const root = skinned ? skeletonClone(baseScene) : baseScene.clone();
+        applySkin(root);
+        root.scale.set(mirror ? -HAND_SCALE : HAND_SCALE, HAND_SCALE, HAND_SCALE);
+        root.rotation.set(RIG_EULER[0], RIG_EULER[1], RIG_EULER[2]);
+        root.visible = false;
+        if (skinned && ARTICULATE) root.userData.driven = buildFingerRig(root);
+        scene.add(root);
+        return root;
+      };
+      leftHandMesh = makeHand(true);
+      rightHandMesh = makeHand(false);
+      tryAttachHands();
+    }
+
+    function loadHandModel() {
+      const loader = new GLTFLoader();
+      loader.load(
+        HAND_URL,
+        (gltf) => {
+          let skinned = false;
+          gltf.scene.traverse((c) => { if (c.isSkinnedMesh) skinned = true; });
+          setupHands(gltf.scene, skinned);
+        },
+        undefined,
+        (err) => { console.warn("Hand model failed; using fallback.", err); setupHands(buildFallbackHand(), false); }
+      );
+    }
+
+    // Full-body avatar (keeps its own materials)
+    function loadBodyModel() {
+      const loader = new GLTFLoader();
+      loader.load(
+        BODY_URL,
+        (gltf) => {
+          bodyRoot = gltf.scene;
+          bodyRoot.scale.setScalar(BODY_SCALE);
+          bodyRoot.rotation.set(BODY_EULER[0], BODY_EULER[1], BODY_EULER[2]);
+          bodyRoot.visible = false;
+          bodyRoot.userData.driven = buildBoneRig(bodyRoot, BODY_SEGMENTS);
+          const neck = bodyRoot.getObjectByName('Neck_07');
+          bodyRoot.userData.head = neck ? makeDriven(neck, null) : null;
+          scene.add(bodyRoot);
+          console.log("Body rig:", bodyRoot.userData.driven.length, "driven bones");
+          tryAttachHands();
+        },
+        undefined,
+        (err) => console.warn("Body model failed.", err)
+      );
+    }
+
+    // Parent rigged hands onto the avatar wrist bones
+    function attachHand(handRoot, wristBone, mirror) {
+      wristBone.add(handRoot);
+      handRoot.position.fromArray(HAND_ATTACH_POS);
+      const s = HAND_ATTACH_SCALE;
+      handRoot.scale.set(mirror ? -s : s, s, s);
+      handRoot.rotation.set(HAND_ATTACH_EULER[0], HAND_ATTACH_EULER[1], HAND_ATTACH_EULER[2]);
+      handRoot.visible = true;
+    }
+    function tryAttachHands() {
+      if (!ATTACH_HANDS_TO_BODY) return;
+      if (!bodyRoot || !leftHandMesh || !rightHandMesh) return;
+      const wristL = bodyRoot.getObjectByName('HandL_06');
+      const wristR = bodyRoot.getObjectByName('HandR_012');
+      if (!wristL || !wristR) { console.warn("Wrist bones not found."); return; }
+      attachHand(leftHandMesh, wristL, true);
+      attachHand(rightHandMesh, wristR, false);
+      // Remove the avatar's built-in mitts
+      bodyRoot.traverse((o) => { if (o.isMesh && /Hands/i.test(o.name)) o.visible = false; });
+      console.log("Rigged hands attached to wrists.");
+    }
+
+    // Generic limb rig from a { boneName: [a,b] } map
+    function buildBoneRig(root, segMap) {
+      const driven = [];
+      for (const nm in segMap) {
+        const bone = root.getObjectByName(nm);
+        if (!bone) { console.warn("Body bone missing:", nm); continue; }
+        const d = makeDriven(bone, segMap[nm]);
+        if (d) driven.push(d);
+      }
+      return driven;
+    }
+
+    // Head: aim neck from shoulder-midpoint toward the nose
+    function driveHead(root, wl) {
+      const d = root.userData.head;
+      if (!d) return;
+      const nose = wl[0], ls = wl[11], rs = wl[12];
+      _v1.set(
+        (nose.x - (ls.x + rs.x) / 2) * BODY_FLIP.x,
+        (nose.y - (ls.y + rs.y) / 2) * BODY_FLIP.y,
+        (nose.z - (ls.z + rs.z) / 2) * BODY_FLIP.z
+      );
+      aimBone(d, _v1);
+    }
+
+    function updatePoseSkeleton(lm) {
+      const linePositions = poseLines.geometry.attributes.position.array;
+      let lineIdx = 0;
+      lm.forEach((p, i) => {
+        poseJoints[i].position.lerp(mapToWorld(p.x, p.y, p.z), lerpFactor);
+        poseJoints[i].visible = SHOW_POSE_SKELETON && p.visibility > 0.5;
+      });
+      POSE_CONNECTIONS.forEach(([s, e]) => {
+        const a = poseJoints[s].position, b = poseJoints[e].position;
+        linePositions[lineIdx++] = a.x; linePositions[lineIdx++] = a.y; linePositions[lineIdx++] = a.z;
+        linePositions[lineIdx++] = b.x; linePositions[lineIdx++] = b.y; linePositions[lineIdx++] = b.z;
+      });
+      poseLines.geometry.attributes.position.needsUpdate = true;
+      poseLines.visible = SHOW_POSE_SKELETON;
+    }
+
+    async function init() {
+      // 1. Setup Three.js Scene
+      const container = document.getElementById("canvas-container");
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 1000);
+      camera.position.set(0, 0, 8);
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // cap for mobile GPUs
+      container.appendChild(renderer.domElement);
+
+      // Lights & tennis court backdrop
+      scene.add(new THREE.AmbientLight(0xffffff, 1.2));
+      const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+      dirLight.position.set(5, 10, 7);
+      scene.add(dirLight);
+      const grid = new THREE.GridHelper(20, 20, 0xffffff, 0x0044aa);
+      grid.position.y = GRID_Y;
+      scene.add(grid);
+
+      // 2. Load models (async, fallback-safe)
+      if (SHOW_HANDS) loadHandModel();
+      if (SHOW_BODY) loadBodyModel();
+
+      // 3. Debug pose skeleton
+      const jointGeo = new THREE.SphereGeometry(0.12, 16, 16);
+      const jointMat = new THREE.MeshStandardMaterial({ color: 0x00ffff, roughness: 0.2 });
+      for (let i = 0; i < 33; i++) {
+        const joint = new THREE.Mesh(jointGeo, jointMat);
+        joint.visible = false;
+        scene.add(joint);
+        poseJoints.push(joint);
+      }
+      const lineMat = new THREE.LineBasicMaterial({ color: 0x00ffff, linewidth: 3 });
+      const lineGeo = new THREE.BufferGeometry();
+      lineGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(POSE_CONNECTIONS.length * 2 * 3), 3));
+      poseLines = new THREE.LineSegments(lineGeo, lineMat);
+      poseLines.visible = false;
+      scene.add(poseLines);
+
+      // 4. Load MediaPipe Tasks
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
+      );
+      // Try GPU delegate first, fall back to CPU (some mobile browsers).
+      const makeLandmarkers = async (delegate) => {
+        handLandmarker = await HandLandmarker.createFromOptions(vision, {
+          baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-assets/hand_landmarker.task", delegate },
+          runningMode: "VIDEO",
+          numHands: 2
+        });
+        poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+          baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-assets/pose_landmarker.task", delegate },
+          runningMode: "VIDEO"
+        });
+      };
+      try {
+        await makeLandmarkers(USE_GPU ? "GPU" : "CPU");
+      } catch (e) {
+        console.warn("GPU delegate failed, falling back to CPU.", e);
+        await makeLandmarkers("CPU");
+      }
+
+      await setupCamera();
+      window.addEventListener('resize', onWindowResize);
+      window.addEventListener('orientationchange', () => setTimeout(onWindowResize, 300));
+      statusEl.style.display = "none";
+      renderer.setAnimationLoop(render);
+    }
+
+    async function setupCamera() {
+      video = document.getElementById("webcam");
+      // facingMode 'user' = front (selfie) camera on iPhone; ideal-constraints
+      // let iOS pick the closest supported resolution instead of failing.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: "user",
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        },
+        audio: false
+      });
+      video.srcObject = stream;
+      await new Promise(resolve => video.onloadedmetadata = resolve);
+      await video.play();
+    }
+
+    // Monotonic timestamps for detectForVideo.
+    // On mobile, throttle detection to ~30 Hz so rendering stays smooth.
+    const IS_MOBILE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+    const DETECT_MS = IS_MOBILE ? 33 : 0;
+    let lastHandTs = -1, lastPoseTs = -1;
+
+    function render() {
+      const now = performance.now();
+      if (video.readyState >= 2) {
+        // --- Hands ---
+        if (SHOW_HANDS && now - lastHandTs > DETECT_MS) {
+          lastHandTs = now;
+          const handResults = handLandmarker.detectForVideo(video, now);
+          const attached = ATTACH_HANDS_TO_BODY && bodyRoot;
+          if (!attached) { // floating hands hide until seen
+            if (leftHandMesh) leftHandMesh.visible = false;
+            if (rightHandMesh) rightHandMesh.visible = false;
+          }
+          let seenL = false, seenR = false;
+          if (handResults.landmarks && handResults.handednesses) {
+            handResults.landmarks.forEach((landmarks, index) => {
+              let cat = handResults.handednesses[index][0].categoryName;
+              if (SWAP_HANDEDNESS) cat = cat === "Left" ? "Right" : "Left";
+              const root = cat === "Left" ? leftHandMesh : rightHandMesh;
+              if (!root) return;
+              const world = handResults.worldLandmarks && handResults.worldLandmarks[index];
+              if (attached) {
+                // Position inherited from wrist bone; drive fingers only
+                if (root.userData.driven && world) driveBones(root.userData.driven, world, FLIP, lerpFactor);
+                if (cat === "Left") seenL = true; else seenR = true;
+              } else {
+                root.visible = true;
+                root.position.lerp(mapToWorld(landmarks[0].x, landmarks[0].y, landmarks[0].z), lerpFactor);
+                if (ARTICULATE && root.userData.driven && world) {
+                  driveBones(root.userData.driven, world, FLIP, lerpFactor);
+                } else {
+                  const indexPos = mapToWorld(landmarks[5].x, landmarks[5].y, landmarks[5].z);
+                  const dir = indexPos.sub(root.position).normalize();
+                  root.quaternion.slerp(_q1.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir), lerpFactor);
+                }
+              }
+            });
+          }
+          // Untracked attached hands ease open -> smooth handoff
+          if (attached) {
+            if (!seenL && leftHandMesh && leftHandMesh.userData.driven) relaxBones(leftHandMesh.userData.driven, lerpFactor);
+            if (!seenR && rightHandMesh && rightHandMesh.userData.driven) relaxBones(rightHandMesh.userData.driven, lerpFactor);
+          }
+        }
+
+        // --- Body pose ---
+        if (now - lastPoseTs > DETECT_MS) {
+          lastPoseTs = now;
+          const poseResults = poseLandmarker.detectForVideo(video, now);
+          const lm = poseResults.landmarks && poseResults.landmarks[0];
+          const wl = poseResults.worldLandmarks && poseResults.worldLandmarks[0];
+          if (lm && wl) {
+            if (bodyRoot && SHOW_BODY) {
+              bodyRoot.visible = true;
+              const hipx = (lm[23].x + lm[24].x) / 2;
+              _v2.copy(mapToWorld(hipx, 0.5, 0)); _v2.y = GRID_Y; _v2.z = 0;
+              bodyRoot.position.lerp(_v2, lerpFactor);
+              if (bodyRoot.userData.driven) driveBones(bodyRoot.userData.driven, wl, BODY_FLIP, lerpFactor);
+              driveHead(bodyRoot, wl);
+            }
+            updatePoseSkeleton(lm);
+          } else {
+            if (bodyRoot) bodyRoot.visible = false;
+            poseLines.visible = false;
+          }
+        }
+      }
+      renderer.render(scene, camera);
+    }
+
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    // iOS Safari only grants camera access from a user gesture, so init
+    // runs behind the Start button instead of on page load.
+    document.getElementById("start-btn").addEventListener("click", () => {
+      document.getElementById("start-overlay").style.display = "none";
+      statusEl.style.display = "";
+      init().catch((e) => {
+        console.error(e);
+        statusEl.style.display = "";
+        statusEl.textContent = "Error: " + e.message;
+      });
+    });
+  </script>
+</body>
+</html>
